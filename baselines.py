@@ -87,6 +87,35 @@ class BaseModel(object):
             self.keep_prob: 0.8
         })
         return loss
+    
+    # 使用后点击行为数据进行训练
+    def train_with_postclick(self, sess, user_seq_batch, user_seq_len_batch, lr, reg_lambda):
+        """
+        使用后点击行为数据进行训练。
+
+        参数:
+        - sess: TensorFlow 会话。
+        - user_seq_batch: 用户行为序列批次。
+        - user_seq_len_batch: 用户行为序列长度批次。
+        - lr: 学习率。
+        - reg_lambda: 正则化参数。
+
+        返回:
+        - loss: 当前批次的损失值。
+        """
+        # 准备输入数据
+        feed_dict = {
+            self.user_seq_ph: user_seq_batch,
+            self.user_seq_length_ph: user_seq_len_batch,
+            self.lr: lr,
+            self.reg_lambda: reg_lambda,
+            self.keep_prob: 0.8
+        }
+
+        # 运行训练步骤并计算损失
+        _, loss = sess.run([self.train_step, self.loss], feed_dict=feed_dict)
+        
+        return loss
 
     def eval(self, sess, batch_data, reg_lambda):
         pred, label, loss = sess.run([self.y_pred, self.label_ph, self.loss], feed_dict={
@@ -160,7 +189,6 @@ def train_din_and_get_item_embeddings(dataset_size, feature_size, eb_dim, hidden
                 din_model.keep_prob: 1.0
             })
             item_embeddings.append(item_emb.flatten())
-
     return np.array(item_embeddings)
 
 class SumPooling(BaseModel):
@@ -697,76 +725,79 @@ class TWIN(BaseModel):
             res = tf.reduce_sum(atten_expanded * key, axis=1)  # [B, Dk]
             return res, atten
 
+
 class TWIN_V2(BaseModel):
-    def __init__(self, feature_size, emb_dim, hidden_size, max_time_len, user_fnum, item_fnum, emb_initializer, top_k=100, item_embeddings=None, n_clusters=10):
-        super(TWIN_V2, self).__init__(feature_size, emb_dim, hidden_size, max_time_len, user_fnum, item_fnum, emb_initializer)
+    def __init__(self, feature_size, emb_dim, hidden_size, max_time_len, user_fnum, item_fnum,
+                 emb_initializer, item_embeddings=None, n_clusters=100):
+        super(TWIN_V2, self).__init__(feature_size, emb_dim, hidden_size, max_time_len,
+                                      user_fnum, item_fnum, emb_initializer)
 
         # 1. 商品嵌入聚类
         self.n_clusters = n_clusters
         self.item_embeddings = item_embeddings  # 预先计算的商品嵌入
+
+        # 计算聚类并将结果转换为 TensorFlow 常量
         self.cluster_centers, self.cluster_labels = self.cluster_item_embeddings()
+        self.cluster_centers_tf = tf.constant(self.cluster_centers, dtype=tf.float32)  # [n_clusters, emb_dim]
+        self.cluster_labels_tf = tf.constant(self.cluster_labels, dtype=tf.int32)  # [num_items]
 
-        # 2. 获取用户行为序列的嵌入维度
-        d_model = self.user_seq.get_shape().as_list()[-1]  # 应为 item_fnum * emb_dim
+        # 2. 选取每个聚类中距离聚类中心最近的商品
+        self.closest_item_ids = self.find_closest_items_to_centers()
+        self.closest_item_ids_tf = tf.constant(self.closest_item_ids, dtype=tf.int32)  # [n_clusters]
 
-        # 3. 目标商品嵌入
-        target_item_emb = tf.layers.dense(self.target_item, d_model, activation=None, name='target_item_emb')  # [B, D]
+        # 3. 获取代表每个聚类的商品嵌入作为聚类表示
+        cluster_item_embeddings = tf.nn.embedding_lookup(self.emb_mtx, self.closest_item_ids_tf)  # [n_clusters, emb_dim]
 
-        # 4. 计算用户行为序列中每个商品与目标商品的相似度得分（点积相似度）
-        seq_score = tf.reduce_sum(self.user_seq * tf.expand_dims(target_item_emb, 1), axis=-1)  # [B, T]
+        # 4. 将聚类表示扩展到批次维度
+        batch_size = tf.shape(self.user_seq_ph)[0]
+        cluster_item_embeddings = tf.tile(tf.expand_dims(cluster_item_embeddings, 0), [batch_size, 1, 1])  # [B, n_clusters, D]
 
-        # 5. 获取序列掩码，处理不同长度的序列
-        mask = tf.sequence_mask(self.user_seq_length_ph, max_time_len, dtype=tf.float32)  # [B, T]
+        # 5. 目标商品嵌入
+        target_item_emb = tf.layers.dense(self.target_item, emb_dim, activation=None, name='target_item_emb')  # [B, D]
 
-        # 6. 处理掩码，设置无效位置得分为一个大的负值
-        mask_score = tf.ones_like(seq_score) * (2 ** 31 - 1)
-        seq_score = tf.where(mask > 0, seq_score, -mask_score)
+        # 6. 对聚类表示和目标商品进行目标注意力
+        user_behavior_rep, _ = self.cluster_aware_attention(cluster_item_embeddings, target_item_emb)
 
-        # 7. 选取Top-K相似度最高的商品
-        topk_score, topk_idx = tf.nn.top_k(seq_score, k=top_k)  # [B, K]
-
-        # 8. 获取Top-K商品的嵌入和掩码
-        topk_emb = tf.batch_gather(self.user_seq, topk_idx)  # [B, K, D]
-        topk_mask = tf.batch_gather(mask, topk_idx)  # [B, K]
-
-        # 9. 对Top-K商品的嵌入进行掩码处理
-        topk_emb = tf.multiply(topk_emb, tf.expand_dims(topk_mask, axis=2))  # [B, K, D]
-
-        # 10. 使用聚类表示和集群感知的目标注意力机制
-        user_behavior_rep, _ = self.cluster_aware_attention(topk_emb, target_item_emb, topk_mask)
-
-        # 11. 将用户行为表示、目标用户和目标商品的嵌入拼接作为模型输入
+        # 7. 将用户行为表示、目标用户和目标商品的嵌入拼接作为模型输入
         inp = tf.concat([user_behavior_rep, self.target_user, self.target_item], axis=1)
 
-        # 12. 构建全连接层和损失函数
+        # 8. 构建全连接层和损失函数
         self.build_fc_net(inp)
         self.build_logloss()
 
     def cluster_item_embeddings(self):
         """对商品嵌入进行聚类"""
         kmeans = KMeans(n_clusters=self.n_clusters, random_state=0).fit(self.item_embeddings)
+        # 返回聚类中心和每个商品的聚类标签
         return kmeans.cluster_centers_, kmeans.labels_
 
-    def cluster_aware_attention(self, cluster_key, query, mask):
+    def find_closest_items_to_centers(self):
+        """找到每个聚类中心最近的商品, 返回商品的ID列表"""
+        closest_item_ids = []
+        for idx, center in enumerate(self.cluster_centers):
+            # 计算所有商品到聚类中心的距离
+            distances = np.linalg.norm(self.item_embeddings - center, axis=1)
+            # 找到距离最小的商品ID
+            closest_item_id = np.argmin(distances)
+            closest_item_ids.append(closest_item_id)
+        return closest_item_ids
+
+    def cluster_aware_attention(self, cluster_embeddings, target_item_emb):
         """实现集群感知的目标注意力机制"""
-        # cluster_key: [B, K, Dk], query: [B, Dq], mask: [B, K]
+        # cluster_embeddings: [B, n_clusters, D]
+        # target_item_emb: [B, D]
         with tf.variable_scope('cluster_aware_attention'):
-            queries = tf.expand_dims(query, 1)  # [B, 1, Dk]
-            queries = tf.tile(queries, [1, tf.shape(cluster_key)[1], 1])  # [B, K, Dk]
+            # 扩展目标商品嵌入的维度
+            queries = tf.expand_dims(target_item_emb, 1)  # [B, 1, D]
+            # 计算注意力得分
+            attn_scores = tf.reduce_sum(cluster_embeddings * queries, axis=-1)  # [B, n_clusters]
+            # 计算注意力权重
+            attn_weights = tf.nn.softmax(attn_scores, axis=1)  # [B, n_clusters]
+            # 计算加权和，得到用户的行为表示
+            attn_weights_expanded = tf.expand_dims(attn_weights, 2)  # [B, n_clusters, 1]
+            weighted_output = tf.reduce_sum(attn_weights_expanded * cluster_embeddings, axis=1)  # [B, D]
+            return weighted_output, attn_weights
 
-            # 计算点积注意力
-            kq_inter = queries * cluster_key  # [B, K, Dk]
-            atten = tf.reduce_sum(kq_inter, axis=2)  # [B, K]
-
-            # 处理掩码，将无效位置的注意力权重设置为一个很小的值
-            paddings = tf.ones_like(atten) * (-2 ** 32 + 1)
-            atten = tf.where(mask > 0, atten, paddings)
-            atten = tf.nn.softmax(atten)  # [B, K]
-
-            # 计算最终的聚合输出
-            atten_expanded = tf.expand_dims(atten, 2)  # [B, K, 1]
-            weighted_output = tf.reduce_sum(atten_expanded * cluster_key, axis=1)  # [B, Dk]
-            return weighted_output, atten
 
 
 
@@ -964,61 +995,199 @@ class SDIM(BaseModel):
         return atten, res
 
 class DGIN(BaseModel):
-    def __init__(self, feature_size, eb_dim, hidden_size, max_time_len, user_fnum, item_fnum, emb_initializer):
-        super(DGIN, self).__init__(feature_size, eb_dim, hidden_size, max_time_len, user_fnum, item_fnum, emb_initializer)
-        
-        # 分组模块
+    def __init__(self, feature_size, eb_dim, hidden_size, max_time_len, user_fnum, item_fnum, emb_initializer, max_num_groups=20):
+        super(DGIN, self).__init__(feature_size, eb_dim, hidden_size, max_time_len,
+                                   user_fnum, item_fnum, emb_initializer)
+
+        self.max_num_groups = max_num_groups
+        self.num_units = item_fnum * eb_dim  # Ensure this matches your embedding dimension
+
+        # Group module
         with tf.name_scope('group_module'):
-            # 使用 item_id 进行分组
-            self.grouped_behaviors = self.group_by_item_id(self.user_seq)
-            
-            # 对组内行为进行 self-attention
-            self.group_representations = self.apply_self_attention(self.grouped_behaviors)
-        
-        # 目标模块
+            # Use tf.map_fn to process each sample individually
+            self.group_representations = tf.map_fn(self.process_single_sequence,
+                                                   (self.user_seq, self.user_seq_length_ph),
+                                                   dtype=tf.float32)
+
+        # Target module
         with tf.name_scope('target_module'):
-            # 对组间行为和目标项目进行 target attention
+            # Apply target attention between group representations and target item
             self.final_interest_representation = self.apply_target_attention(self.group_representations, self.target_item)
-        
-        # 全连接层
+
+        # Fully connected layers
         inp = tf.concat([self.final_interest_representation, self.target_user, self.target_item], axis=1)
         self.build_fc_net(inp)
         self.build_logloss()
 
-    def group_by_item_id(self, user_seq):
-        # 假设 user_seq 的每一行为包含 item_id 信息
-        # 这里实现简单的分组逻辑，可以根据实际需求进行调整
-        # 返回值为分组后的行为序列
-        grouped_behaviors = {}  # 用字典存储分组结果，key 是 item_id，value 是行为列表
-        for behavior in user_seq:
-            item_id = behavior  # 提取每个的item_id
-            if item_id not in grouped_behaviors:
-                grouped_behaviors[item_id] = []
-            grouped_behaviors[item_id].append(behavior) # 这个地方有问题！！！
+    def process_single_sequence(self, inputs):
+        # Unpack inputs
+        seq, seq_len = inputs  # seq: [max_time_len, feature_dim], seq_len: scalar
+        seq = seq[:seq_len]  # [seq_len, feature_dim]
+        item_ids = tf.cast(seq[:, 0], tf.int32)  # [seq_len]
+
+        # Map item_id to fixed number of groups
+        bucket_ids = tf.mod(item_ids, self.max_num_groups)  # [seq_len], mapped to [0, max_num_groups - 1]
+
+        # Use fixed number of partitions
+        num_partitions = self.max_num_groups
+
+        # Partition the sequence
+        grouped_seq = tf.dynamic_partition(seq, bucket_ids, num_partitions)  # List of Tensors
+
+        # Apply self-attention to each group
+        group_reps = []
+        for i in range(self.max_num_groups):
+            group = grouped_seq[i]  # [group_size_i, feature_dim]
+            group_size = tf.shape(group)[0]
+
+            def compute_group_rep(group):
+                group_expanded = tf.expand_dims(group, 0)  # [1, group_size_i, feature_dim]
+                group_rep = self.multihead_self_attention(group_expanded)  # [1, group_size_i, num_units]
+                group_rep = tf.reduce_mean(group_rep, axis=1)  # [1, num_units]
+                group_rep = tf.squeeze(group_rep, axis=0)  # [num_units]
+                return group_rep
+
+            def zero_group_rep():
+                return tf.zeros([self.num_units], dtype=tf.float32)
+
+            # Use lambda to capture 'group' variable
+            group_rep = tf.cond(group_size > 0, lambda grp=group: compute_group_rep(grp), zero_group_rep)  # [num_units]
+            group_reps.append(group_rep)
+
+        group_reps = tf.stack(group_reps)  # [max_num_groups, num_units]
+        return group_reps  # [max_num_groups, num_units]
+
+    def multihead_self_attention(self, group):
+        # group: [batch_size=1, group_size_i, feature_dim]
+        num_units = self.num_units
+
+        Q = tf.layers.dense(group, num_units, activation=None)
+        K = tf.layers.dense(group, num_units, activation=None)
+        V = tf.layers.dense(group, num_units, activation=None)
+
+        outputs = tf.matmul(Q, tf.transpose(K, [0, 2, 1]))
+        outputs = outputs / tf.sqrt(tf.cast(num_units, tf.float32))
+
+        outputs = tf.nn.softmax(outputs)
+        outputs = tf.matmul(outputs, V)
+        return outputs  # [1, group_size_i, num_units]
+
+    def apply_target_attention(self, group_representations, target_item):
+        # group_representations: [batch_size, max_num_groups, num_units]
+        # target_item: [batch_size, item_fnum * emb_dim]
+
+        # Project target_item to match group_representations dimension
+        target_item_dense = tf.layers.dense(target_item, self.num_units, activation=None)
+        # target_item_dense: [batch_size, num_units]
+
+        # Expand target_item for attention computation
+        target_item_expanded = tf.expand_dims(target_item_dense, 1)  # [batch_size, 1, num_units]
+
+        # Compute attention scores
+        scores = tf.reduce_sum(group_representations * target_item_expanded, axis=2)  # [batch_size, max_num_groups]
+        scores = tf.nn.softmax(scores, axis=1)  # [batch_size, max_num_groups]
+
+        # Compute weighted sum
+        scores_expanded = tf.expand_dims(scores, 2)  # [batch_size, max_num_groups, 1]
+        final_representation = tf.reduce_sum(scores_expanded * group_representations, axis=1)  # [batch_size, num_units]
+
+        return final_representation  # [batch_size, num_units]
+
+
+class DGIN_V2(BaseModel):
+    def __init__(self, feature_size, emb_dim, hidden_size, max_time_len, user_fnum, item_fnum, emb_initializer, item_embeddings=None, n_clusters=100):
+        super(DGIN_V2, self).__init__(feature_size, emb_dim, hidden_size, max_time_len, user_fnum, item_fnum, emb_initializer)
+
+        # 1. 商品嵌入聚类
+        self.n_clusters = n_clusters
+        self.item_embeddings = item_embeddings  # 预先计算的商品嵌入
+
+        # 计算聚类并将结果转换为TensorFlow常量
+        self.cluster_centers, self.cluster_labels = self.cluster_item_embeddings()
+
+        # 将 cluster_centers 转换为 TensorFlow 常量
+        self.cluster_centers_tf = tf.constant(self.cluster_centers, dtype=tf.float32)
+
+        # 将 cluster_labels 转换为 TensorFlow 常量
+        self.cluster_labels_tf = tf.constant(self.cluster_labels, dtype=tf.int32)
+
+        # 2. 获取用户行为序列的嵌入维度
+        d_model = self.user_seq.get_shape().as_list()[-1]  # 应为 item_fnum * emb_dim
+
+        # 3. 目标商品嵌入
+        target_item_emb = tf.layers.dense(self.target_item, d_model, activation=None, name='target_item_emb')  # [B, D]
+
+        # 4. 分组模块
+        with tf.name_scope('group_module'):
+            # 使用聚类标签进行分组
+            self.grouped_behaviors = self.group_by_cluster(self.user_seq)
+            
+            # 对组内行为进行 self-attention
+            self.group_representations = self.apply_self_attention(self.grouped_behaviors)
         
-        # 将字典转换为列表形式
-        grouped_list = [group for group in grouped_behaviors.values()]
-        return grouped_list
+        # 5. 目标模块
+        with tf.name_scope('target_module'):
+            # 对组间表示和目标商品进行 target attention，包含聚类中心
+            self.final_interest_representation = self.apply_target_attention(self.group_representations, target_item_emb)
+        
+        # 6. 全连接层
+        inp = tf.concat([self.final_interest_representation, self.target_user, self.target_item], axis=1)
+        self.build_fc_net(inp)
+        self.build_logloss()
+
+    def cluster_item_embeddings(self):
+        # 使用 KMeans 对 item_embeddings 进行聚类
+        kmeans = KMeans(n_clusters=self.n_clusters, random_state=0).fit(self.item_embeddings)
+        cluster_centers = kmeans.cluster_centers_
+        cluster_labels = kmeans.labels_
+        return cluster_centers, cluster_labels
+
+    def group_by_cluster(self, user_seq):
+        # 使用 cluster_labels 对 user_seq 进行分组
+        # 假设 item_id 位于 user_seq_ph 的第一个特征位置，因此需要在输入数据中包含 item_id
+        item_ids = self.user_seq_ph[:, :, 0]  # [B, T]
+
+        # 获取每个 item_id 对应的 cluster label
+        item_cluster_labels = tf.gather(self.cluster_labels_tf, tf.cast(item_ids, tf.int32))  # [B, T]
+
+        # 创建掩码，处理序列填充部分
+        mask = tf.sequence_mask(self.user_seq_length_ph, maxlen=self.user_seq_ph.shape[1], dtype=tf.float32)  # [B, T]
+
+        # 将掩码应用于 item_cluster_labels
+        item_cluster_labels = tf.where(tf.equal(mask, 1.0), item_cluster_labels, tf.fill(tf.shape(item_cluster_labels), -1))
+
+        # 对每个 cluster 创建掩码
+        masks = []
+        for cluster_id in range(self.n_clusters):
+            masks.append(tf.equal(item_cluster_labels, cluster_id))  # [B, T]
+
+        # 对每个 cluster 提取对应的行为
+        grouped_behaviors = []
+        for cluster_mask in masks:
+            cluster_behavior = tf.boolean_mask(self.user_seq, cluster_mask)
+            grouped_behaviors.append(cluster_behavior)
+
+        return grouped_behaviors
 
     def apply_self_attention(self, grouped_behaviors):
         # 对每个组应用 self-attention
         group_representations = []
         for group in grouped_behaviors:
-            group_rep = self.multihead_self_attention(group)
+            if group.shape[0] == 0:
+                # 如果该组为空，添加一个零向量
+                group_rep = tf.zeros([1, self.user_seq.get_shape().as_list()[-1]], dtype=tf.float32)
+            else:
+                group_rep = self.multihead_self_attention(tf.expand_dims(group, 0))  # 扩展维度以匹配批次维度
+                group_rep = tf.reduce_mean(group_rep, axis=1)  # [1, D]
             group_representations.append(group_rep)
+        # 将 group_representations 堆叠起来
+        group_representations = tf.stack(group_representations, axis=1)  # [B, n_clusters, D]
         return group_representations
-
-    def apply_target_attention(self, group_representations, target_item):
-        # 对组间表示和目标项目应用 target attention
-        # 使用 DIN 中的 attention 函数实现
-        _, target_representation = self.attention(group_representations, group_representations, target_item, mask=None)
-        return target_representation
 
     def multihead_self_attention(self, group):
         # 使用多头自注意力机制计算组的表示
-        # 经典的 QKV 范式实现
         num_units = group.get_shape().as_list()[-1]
-        
+
         Q = tf.layers.dense(group, num_units, activation=None)
         K = tf.layers.dense(group, num_units, activation=None)
         V = tf.layers.dense(group, num_units, activation=None)
@@ -1026,29 +1195,47 @@ class DGIN(BaseModel):
         # 计算注意力权重
         outputs = tf.matmul(Q, tf.transpose(K, [0, 2, 1]))
         outputs = outputs / (K.get_shape().as_list()[-1] ** 0.5)
-        
+
         # softmax 激活
         outputs = tf.nn.softmax(outputs)
-        
+
         # 加权求和
         outputs = tf.matmul(outputs, V)
         return outputs
 
+    def apply_target_attention(self, group_representations, target_item):
+        # 将 cluster_centers_tf 与 group_representations 合并
+        # 先将 cluster_centers_tf 扩展到 batch 维度
+        batch_size = tf.shape(self.user_seq_ph)[0]
+        cluster_centers_expanded = tf.tile(tf.expand_dims(self.cluster_centers_tf, 0), [batch_size, 1, 1])  # [B, n_clusters, D]
+
+        # 将 group_representations 与 cluster_centers_tf 相加或拼接
+        # 在这里，我们选择将两者拼接
+        combined_keys = tf.concat([group_representations, cluster_centers_expanded], axis=-1)  # [B, n_clusters, 2D]
+
+        # 对 target_item 进行线性变换以匹配 combined_keys 的最后一维
+        target_item_transformed = tf.layers.dense(target_item, combined_keys.get_shape().as_list()[-1], activation=None)
+
+        # 计算 group_representations 与 target_item 之间的注意力
+        _, target_representation = self.attention(combined_keys, combined_keys, target_item_transformed, mask=None)
+        return target_representation
+
     def attention(self, key, value, query, mask):
-        # key: [B, T, Dk], query: [B, Dq], mask: [B, T]
-        _, max_len, k_dim = key.get_shape().as_list()
-        query = tf.layers.dense(query, k_dim, activation=None)
-        queries = tf.tile(tf.expand_dims(query, 1), [1, max_len, 1])  # [B, T, Dk]
-        kq_inter = queries * key
-        atten = tf.reduce_sum(kq_inter, axis=2)
+        # key: [B, n_clusters, 2D]
+        # value: [B, n_clusters, 2D]
+        # query: [B, 2D]
 
-        if mask is not None:
-            mask = tf.equal(mask, tf.ones_like(mask))  # [B, T]
-            paddings = tf.ones_like(atten) * (-2 ** 32 + 1)
-            atten = tf.nn.softmax(tf.where(mask, atten, paddings))  # [B, T]
-        else:
-            atten = tf.nn.softmax(atten)  # [B, T]
-        atten = tf.expand_dims(atten, 2)
+        # 扩展 query 的维度
+        query = tf.expand_dims(query, 1)  # [B, 1, 2D]
 
-        res = tf.reduce_sum(atten * value, axis=1)
+        # 计算注意力得分
+        scores = tf.reduce_sum(query * key, axis=-1)  # [B, n_clusters]
+
+        # 应用 softmax
+        atten = tf.nn.softmax(scores)  # [B, n_clusters]
+
+        # 计算加权和
+        atten = tf.expand_dims(atten, 2)  # [B, n_clusters, 1]
+        res = tf.reduce_sum(atten * value, axis=1)  # [B, 2D]
         return atten, res
+

@@ -184,3 +184,48 @@ class DataLoader_Multi(object):
     
         re = self.res.get()
         return re
+    
+class DataLoader_Postclick(object):
+    def __init__(self, batch_size, seq_postclick_file, max_len):
+        self.batch_size = batch_size
+        self.seq_postclick_file = open(seq_postclick_file, 'r')
+        self.max_len = max_len
+
+    def __iter__(self):
+        return self
+    
+    def __next__(self):
+        user_seq_batch = []
+        user_seq_len_batch = []
+
+        for i in range(self.batch_size):
+            seq_line = self.seq_postclick_file.readline()
+            if seq_line == '':
+                raise StopIteration
+
+            user_id, *item_actions = seq_line.strip().split(',')
+            user_seq = []
+
+            for item_action in item_actions:
+                item_id, action_type, timestamp = item_action.split(':')
+                item_id = int(item_id)
+                timestamp = int(timestamp)
+                # 这里假设 action_type 被编码为一个整数，具体编码需根据实际情况调整
+                action_type_encoded = self.encode_action_type(action_type)
+                user_seq.append((item_id, action_type_encoded, timestamp))
+
+            seqlen = len(user_seq)
+            if seqlen >= self.max_len:
+                user_seq = user_seq[-self.max_len:]
+                user_seq_len_batch.append(self.max_len)
+            else:
+                user_seq += [(0, 0, 0)] * (self.max_len - seqlen)
+                user_seq_len_batch.append(seqlen)
+            user_seq_batch.append(user_seq)
+
+        return user_seq_batch, user_seq_len_batch
+
+    def encode_action_type(self, action_type):
+        # 将行为类型编码为整数, pv=0, buy=1, cart=2, fav=3
+        action_type_dict = {'pv': 0, 'buy': 1, 'cart': 2, 'fav': 3}
+        return action_type_dict.get(action_type, 0)
