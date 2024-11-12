@@ -291,7 +291,7 @@ def train(data_set_name, target_train_file, target_vali_file, user_seq_file, use
                 # 使用 postclick_loader 代替 DataLoader
                 for user_seq_batch, user_seq_len_batch in postclick_loader:
                     # 这里假设模型有一个方法可以处理 post-click 数据
-                    loss = model.train_with_postclick(sess, user_seq_batch, user_seq_len_batch, user_seq_postclick_file, lr, reg_lambda)
+                    loss = model.train_with_postclick(sess, user_seq_batch, user_seq_len_batch, lr, reg_lambda)
                     step += 1
                     train_losses_step.append(loss)
 
