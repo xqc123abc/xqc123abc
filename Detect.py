@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, explained_variance_score
 from sklearn.preprocessing import StandardScaler
+from torch.utils.data import random_split
 import time
 import can
 import re
@@ -176,6 +177,64 @@ def extract_time_ucell(filepath='U_100.txt'):
     return df.iloc[-25:, :1]
 
 
+def load_voltage_tem_tensors(folder='JCJQ_Normal_data'):
+    """
+    批量读取电压和温度文件，并转换为单个张量，进行全局归一化。
+    
+    返回：
+        volt_tensor: Tensor，[num_samples, time_steps]，电压归一化到 [0,1]
+        tem_tensor: Tensor，[num_samples, time_steps]，温度归一化到 [0,1]
+        current_tensor: Tensor，[num_samples, 2]，每个样本的充放电倍率 [rate_ch, rate_dch]
+        time_list: list[pd.Index]，每个样本的时间索引
+    """
+    voltage_files = sorted([f for f in os.listdir(folder) if f.startswith('U_')])
+    tem_files = sorted([f for f in os.listdir(folder) if f.startswith('T_')])
+
+    n_pairs = min(len(voltage_files), len(tem_files))
+    print(f"检测到 {n_pairs} 对电压-温度文件。")
+
+    all_v_values, all_t_values, current_list, time_list = [], [], [], []
+
+    # 读取所有样本数据
+    for i in range(0, n_pairs, 30):
+        # 注意，仅仅取了部分文件
+        df_v = extract_time_ucell(voltage_files[i])
+        df_t = extract_time_ucell(tem_files[i])
+
+        common_time = df_v.index.intersection(df_t.index)
+        v_values = df_v.loc[common_time].iloc[:, 0].to_numpy(dtype='float32')
+        t_values = df_t.loc[common_time].iloc[:, 0].to_numpy(dtype='float32')
+
+        all_v_values.append(v_values)
+        all_t_values.append(t_values)
+        time_list.append(common_time)
+
+        # 充放电倍率
+        rate_ch, rate_dch = get_charge_discharge_rates(i+1)
+        current_list.append([rate_ch, rate_dch])
+
+    # 将列表转换为 NumPy 数组方便计算全局归一化
+    all_v_array = np.stack(all_v_values)  # shape: [num_samples, time_steps]
+    all_t_array = np.stack(all_t_values)
+
+    # 全局归一化
+    v_min, v_max = all_v_array.min(), all_v_array.max()
+    t_min, t_max = all_t_array.min(), all_t_array.max()
+
+    print(f"电压全局归一化: min={v_min}, max={v_max}")
+    print(f"温度全局归一化: min={t_min}, max={t_max}")
+
+    all_v_array = (all_v_array - v_min) / (v_max - v_min)
+    all_t_array = (all_t_array - t_min) / (t_max - t_min)
+
+    # 转换为张量
+    volt_tensor = torch.tensor(all_v_array, dtype=torch.float32)
+    tem_tensor = torch.tensor(all_t_array, dtype=torch.float32)
+    current_tensor = torch.tensor(current_list, dtype=torch.float32)
+
+    return volt_tensor, tem_tensor, current_tensor, time_list
+
+
 def load_new_data_tensors(folder='JCJQ_Normal_data'):
     """
     批量读取新数据（电压和温度文件），并转换为张量，进行全局归一化。
@@ -234,8 +293,23 @@ def load_new_data_tensors(folder='JCJQ_Normal_data'):
     return volt_tensor, tem_tensor, current_tensor, time_list
 
 
+# 构建 PyTorch Dataset（与训练脚本一致）
+class TimeSeriesDataset(torch.utils.data.Dataset):
+    def __init__(self, input_seq, rate_ch, rate_dch, target):
+        self.input_seq = input_seq
+        self.rate_ch = rate_ch
+        self.rate_dch = rate_dch
+        self.target = target
+
+    def __len__(self):
+        return self.input_seq.shape[0]
+
+    def __getitem__(self, idx):
+        return (self.input_seq[idx], self.rate_ch[idx], self.rate_dch[idx], self.target[idx])
+
+
 class NewDataPredictModel(nn.Module):
-    """新数据的预测模型"""
+    """新数据的预测模型 - 与训练脚本完全一致的模型结构"""
     def __init__(self, time_steps=5, embedding_dim=4, hidden_dim=16, num_layers=1):
         super().__init__()
         # 假设充放电倍率离散值最大为 11（根据实际修改）
@@ -245,6 +319,7 @@ class NewDataPredictModel(nn.Module):
         self.lstm = nn.LSTM(input_size=2 + 2*embedding_dim, hidden_size=hidden_dim,
                             num_layers=num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_dim, 2)  # 输出温度和电压预测
+        self.time_fc = nn.Linear(20, time_steps)  # 添加缺失的层（与训练脚本一致）
 
     def forward(self, x_seq, rate_ch, rate_dch):
         # x_seq: [batch, time_steps, 2]
@@ -750,48 +825,80 @@ def process_new_data(myargs, device):
     """处理新数据的流程"""
     print("使用新数据处理流程...")
     
-    # 加载新数据
-    data_folder = myargs.data_path_Normal
-    volt_tensors, tem_tensors, current_list, time_list = load_new_data_tensors(data_folder)
+    # 加载新数据 - 与训练脚本一样的数据加载方式
+    volt_tensors, tem_tensors, current_list, time_list = load_voltage_tem_tensors()
+    
+    # 假设 time_steps = 20
+    num_samples, time_steps = volt_tensors.shape
+    
+    # 离散化充放电倍率（与训练脚本一致）
+    rate_ch = (10*current_list[:, 0]).long()
+    rate_dch = (10*current_list[:, 1]).long()
+    
+    # 构建输入特征（与训练脚本一致）
+    input_features = torch.stack([tem_tensors[:, :-5], volt_tensors[:, :-5]], dim=2)  # shape: [num_samples, time_steps, 2]
+    
+    # 目标为未来5个时刻（与训练脚本一致）
+    target = torch.stack([tem_tensors[:, -5:], volt_tensors[:, -5:]], dim=2)
+    
+    # 数据集划分（与训练脚本一致）
+    dataset_size = num_samples
+    train_size = int(0.8 * dataset_size)
+    test_size = dataset_size - train_size
+    
+    # 构建数据集（与训练脚本一致）
+    dataset = TimeSeriesDataset(input_features, rate_ch, rate_dch, target)
+    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
     
     # 加载新数据模型
     new_data_model = load_new_data_model(device=device)
     
-    # 离散化充放电倍率
-    rate_ch = (10*current_list[:, 0]).long()
-    rate_dch = (10*current_list[:, 1]).long()
+    # 计算阈值 - 使用训练集的平均MSE作为基准（与老数据处理方式一致）
+    print("计算检测阈值...")
+    train_mse_list = []
+    with torch.no_grad():
+        for i in range(len(train_dataset)):  # 取部分训练样本计算阈值
+            x_seq, ch, dch, y_true = train_dataset[i]
+            x_seq = x_seq.unsqueeze(0).to(device)
+            ch = torch.tensor([ch.item()]).to(device)
+            dch = torch.tensor([dch.item()]).to(device)
+            y_true = y_true.unsqueeze(0).to(device)
+            
+            y_pred = new_data_model(x_seq, ch, dch)
+            mse = torch.mean((y_pred - y_true) ** 2).item()
+            train_mse_list.append(mse)
     
-    # 构建输入特征
-    input_features = torch.stack([tem_tensors[:, :-5], volt_tensors[:, :-5]], dim=2)
+    # 阈值计算方式与老数据一致：使用训练集的平均MSE
+    threshold = np.mean(train_mse_list)
+    print(f"检测阈值: {threshold:.6f} (基于训练集平均MSE)")
     
-    # 目标为未来5个时刻
-    target = torch.stack([tem_tensors[:, -5:], volt_tensors[:, -5:]], dim=2)
-    
-    # 模拟检测过程
+    # 检测过程
     detect_dict = {}
     batch = 1
     
     print("开始新数据检测...")
-    for i in range(min(10, len(input_features))):  # 只处理前10个样本作为示例
-        x_seq = input_features[i:i+1].to(device)
-        ch = rate_ch[i:i+1].to(device)
-        dch = rate_dch[i:i+1].to(device)
+    # 使用测试集进行检测
+    for i in range(min(10, len(test_dataset))):  # 只处理前10个测试样本作为示例
+        # 从测试集获取样本
+        x_seq, ch, dch, y_true = test_dataset[i]
+        x_seq = x_seq.unsqueeze(0).to(device)
+        ch = torch.tensor([ch.item()]).to(device)  # 处理标量索引
+        dch = torch.tensor([dch.item()]).to(device)  # 处理标量索引
+        y_true = y_true.unsqueeze(0).to(device)
         
         with torch.no_grad():
             y_pred = new_data_model(x_seq, ch, dch)
-            y_true = target[i:i+1].to(device)
             
             # 计算预测误差
             mse = torch.mean((y_pred - y_true) ** 2).item()
             
-            # 简单的阈值判断（可以根据实际情况调整）
-            threshold = 0.01  # 示例阈值
+            # 阈值判断（与老数据处理方式一致）
             if mse > threshold:
                 detect_dict[f"新数据样本_{batch}"] = 1
-                print(f"样本 {batch}: 检测到异常 (MSE: {mse:.6f})")
+                print(f"样本 {batch}: 检测到异常 (MSE: {mse:.6f} > 阈值: {threshold:.6f})")
             else:
                 detect_dict[f"新数据样本_{batch}"] = 0
-                print(f"样本 {batch}: 正常 (MSE: {mse:.6f})")
+                print(f"样本 {batch}: 正常 (MSE: {mse:.6f} <= 阈值: {threshold:.6f})")
         
         batch += 1
     
@@ -954,7 +1061,7 @@ if __name__ == "__main__":
         # 读取设备
         parser.add_argument('--device', type=str, default='cpu')
 
-        parser.add_argument('--data_path_Normal', type=str, default='20240118锂电测试数据（内部）_10000.csv',
+        parser.add_argument('--data_path_Normal', type=str, default='JCJQ_Normal_data',
                             help='path to Normal dataset')
         parser.add_argument('--window', type=int, default=10,
                             help='window size')
