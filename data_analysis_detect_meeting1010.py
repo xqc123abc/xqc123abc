@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 
-def get_charge_discharge_rates(target_simulation_num,log_file_path='JCJQ_Normal_data\JCJQ_Normal_data\simulation_log.txt'):
+def get_charge_discharge_rates(target_simulation_num,log_file_path='JCJQ_Normal_data/simulation_log.txt'):
     """
     从模拟日志文件中提取指定编号对应的充电倍率和放电倍率
     
@@ -75,7 +75,7 @@ def extract_time_ucell(filepath='U_100.txt') -> pd.DataFrame:
         pd.DataFrame: 仅包含“时间”和“Ucell_1-1”两列的数据
     """
     # 过滤掉以 % 开头的注释行
-    filepath = os.path.join('JCJQ_Normal_data\JCJQ_Normal_data',filepath)
+    filepath = os.path.join('JCJQ_Normal_data', filepath)
     with open(filepath, 'r', encoding='gbk') as f:
         lines = [line.strip() for line in f if not line.startswith('%') and line.strip() != '']
 
@@ -90,7 +90,7 @@ def extract_time_ucell(filepath='U_100.txt') -> pd.DataFrame:
     return df.iloc[-25:,:1]
 
 
-def load_voltage_tem_tensors(folder='JCJQ_Normal_data/JCJQ_Normal_data'):
+def load_voltage_tem_tensors(folder='JCJQ_Normal_data'):
     """
     批量读取电压和温度文件，并转换为单个张量，进行全局归一化。
     
