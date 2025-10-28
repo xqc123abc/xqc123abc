@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, explained_variance_score
 from sklearn.preprocessing import StandardScaler
-from torch.utils.data import random_split
+from torch.utils.data import random_split, Subset
 import time
 import can
 import re
@@ -151,7 +151,7 @@ def get_charge_discharge_rates(target_simulation_num, log_file_path='JCJQ_Normal
         return None, None
 
 
-def extract_time_ucell(filepath='U_100.txt'):
+def extract_time_ucell(filepath='U_100.txt', window=20, predLen=5):
     """
     从 COMSOL 导出的 CSV 文件中提取"时间"和"Ucell_1-1"列。
     
@@ -174,18 +174,18 @@ def extract_time_ucell(filepath='U_100.txt'):
 
     # 提取目标列
     # !! 注意，此处只提取一个单体的前25个时刻
-    return df.iloc[-25:, :1]
+    # return df.iloc[-(window+predLen):, :1]
+    return df.iloc[-(window+predLen):, :]
 
 
-def load_voltage_tem_tensors(folder='JCJQ_Normal_data'):
+def load_voltage_tem_tensors(folder='JCJQ_Normal_data', window=20, predLen=5, cells_num=22):
     """
-    批量读取电压和温度文件，并转换为单个张量，进行全局归一化。
+    批量读取电压和温度文件（多列/多电池单元），并转换为张量，进行全局归一化。
     
     返回：
-        volt_tensor: Tensor，[num_samples, time_steps]，电压归一化到 [0,1]
-        tem_tensor: Tensor，[num_samples, time_steps]，温度归一化到 [0,1]
-        current_tensor: Tensor，[num_samples, 2]，每个样本的充放电倍率 [rate_ch, rate_dch]
-        time_list: list[pd.Index]，每个样本的时间索引
+        allCells_VAndT: list，每个元素是 [2, time_steps] 的数组，[voltage, temperature]
+        current_tensor: Tensor，[num_samples*cells_num, 2]，每个样本每个cell的充放电倍率
+        time_list: list，每个样本的时间索引
     """
     voltage_files = sorted([f for f in os.listdir(folder) if f.startswith('U_')])
     tem_files = sorted([f for f in os.listdir(folder) if f.startswith('T_')])
@@ -193,46 +193,54 @@ def load_voltage_tem_tensors(folder='JCJQ_Normal_data'):
     n_pairs = min(len(voltage_files), len(tem_files))
     print(f"检测到 {n_pairs} 对电压-温度文件。")
 
-    all_v_values, all_t_values, current_list, time_list = [], [], [], []
-
+    allCells_VAndT = []
+    current_list = []
+    time_list = []
+    
     # 读取所有样本数据
-    for i in range(0, n_pairs, 30):
+    for i in range(0, n_pairs, 17):
         # 注意，仅仅取了部分文件
-        df_v = extract_time_ucell(voltage_files[i])
-        df_t = extract_time_ucell(tem_files[i])
+        df_v = extract_time_ucell(voltage_files[i], window=20, predLen=5)
+        df_t = extract_time_ucell(tem_files[i], window=20, predLen=5)
 
         common_time = df_v.index.intersection(df_t.index)
-        v_values = df_v.loc[common_time].iloc[:, 0].to_numpy(dtype='float32')
-        t_values = df_t.loc[common_time].iloc[:, 0].to_numpy(dtype='float32')
+        v_values = df_v.loc[common_time].iloc[:, :].to_numpy(dtype='float32')
+        t_values = df_t.loc[common_time].iloc[:, :].to_numpy(dtype='float32')
 
-        all_v_values.append(v_values)
-        all_t_values.append(t_values)
-        time_list.append(common_time)
+        # 为每个cell分别存储其电压和温度数据
+        for j in range(cells_num):
+            allCells_VAndT.append(np.array([v_values[:, j], t_values[:, j]]))
+            time_list.append(common_time)
 
-        # 充放电倍率
+        # 充放电倍率 - 每个样本重复cells_num次
         rate_ch, rate_dch = get_charge_discharge_rates(i+1)
-        current_list.append([rate_ch, rate_dch])
+        for _ in range(cells_num):
+            current_list.append([rate_ch, rate_dch])
 
-    # 将列表转换为 NumPy 数组方便计算全局归一化
-    all_v_array = np.stack(all_v_values)  # shape: [num_samples, time_steps]
-    all_t_array = np.stack(all_t_values)
-
-    # 全局归一化
-    v_min, v_max = all_v_array.min(), all_v_array.max()
-    t_min, t_max = all_t_array.min(), all_t_array.max()
+    # 计算全局归一化参数
+    # 收集所有数据用于计算全局min和max
+    all_v_data = np.concatenate([cell_data[0] for cell_data in allCells_VAndT])
+    all_t_data = np.concatenate([cell_data[1] for cell_data in allCells_VAndT])
+    
+    v_min, v_max = all_v_data.min(), all_v_data.max()
+    t_min, t_max = all_t_data.min(), all_t_data.max()
 
     print(f"电压全局归一化: min={v_min}, max={v_max}")
     print(f"温度全局归一化: min={t_min}, max={t_max}")
 
-    all_v_array = (all_v_array - v_min) / (v_max - v_min)
-    all_t_array = (all_t_array - t_min) / (t_max - t_min)
+    # 对每个cell的数据进行归一化
+    normalized_cells = []
+    for cell_data in allCells_VAndT:
+        v_normalized = (cell_data[0] - v_min) / (v_max - v_min)
+        t_normalized = (cell_data[1] - t_min) / (t_max - t_min)
+        normalized_cells.append(np.array([v_normalized, t_normalized]))
 
-    # 转换为张量
-    volt_tensor = torch.tensor(all_v_array, dtype=torch.float32)
-    tem_tensor = torch.tensor(all_t_array, dtype=torch.float32)
+    # 转换为张量（先转换为numpy array避免慢速警告）
+    normalized_cells_array = np.stack(normalized_cells)  # [num_samples*cells_num, 2, time_steps]
+    allCells_tensor = torch.tensor(normalized_cells_array, dtype=torch.float32)
     current_tensor = torch.tensor(current_list, dtype=torch.float32)
 
-    return volt_tensor, tem_tensor, current_tensor, time_list
+    return allCells_tensor, current_tensor, time_list
 
 
 def load_new_data_tensors(folder='JCJQ_Normal_data'):
@@ -254,7 +262,7 @@ def load_new_data_tensors(folder='JCJQ_Normal_data'):
     all_v_values, all_t_values, current_list, time_list = [], [], [], []
 
     # 读取所有样本数据
-    for i in range(0, n_pairs, 30):  # 每30个文件取一个样本
+    for i in range(0, n_pairs, 17):  # 每24个文件取一个样本
         # 注意，仅仅取了部分文件
         df_v = extract_time_ucell(voltage_files[i])
         df_t = extract_time_ucell(tem_files[i])
@@ -822,42 +830,66 @@ def getDataLiter(data):
 stop_flag = False  # 全局标志位
 
 def process_new_data(myargs, device):
-    """处理新数据的流程"""
-    print("使用新数据处理流程...")
+    # todo:
+    # 1.首先将JCJQ_Normal_data作为正常数据集输入，然后要根据这个正常数据集计算出各个单体的均值和方差，修改为对所有电池单体进行数据预处理，给出每个电池单体的均值和标准差（不是用归一化，是正则化）
+    # 2.再使用JCJQ_Normal_data作为模拟测试数据，不需要用TimeSeriesDataset构建数据集，也不用分测试集和训练集，因为我们这个软件最初的设想就是处理送进来的所有数据。最好能做到每次主循环处理一个样本（就是原始数据，包含所有单体），然后对这一个样本进行正则化，并将其分为各个单体，数据结构为：(cellsNum, timeSteps, features)
+    # 3.对每个单体进行预测，来不及训练模型的话就先用同一个模型，然后阈值取单体正常数据最大的阈值即可
+    """处理新数据的流程（多cell版本）"""
+    print("使用新数据处理流程（多cell）...")
     
-    # 加载新数据 - 与训练脚本一样的数据加载方式
-    volt_tensors, tem_tensors, current_list, time_list = load_voltage_tem_tensors()
+    # 加载新数据 - 返回 [num_samples*cells_num, 2, time_steps]
+    window = myargs.newwindow
+    predLen = myargs.newpredLen
+    cells_num = 22
+    allCells_tensor, current_list, time_list = load_voltage_tem_tensors(
+        window=window, predLen=predLen, cells_num=cells_num
+    )
     
-    # 假设 time_steps = 20
-    num_samples, time_steps = volt_tensors.shape
+    # allCells_tensor 形状: [num_samples*cells_num, 2, time_steps]
+    # 其中 [:, 0, :] 是电压，[:, 1, :] 是温度
+    num_total_cells, _, time_steps = allCells_tensor.shape
     
-    # 离散化充放电倍率（与训练脚本一致）
+    # 将电压和温度数据分开
+    volt_tensors = allCells_tensor[:, 0, :]  # [num_samples*cells_num, time_steps]
+    tem_tensors = allCells_tensor[:, 1, :]   # [num_samples*cells_num, time_steps]
+    
+    # 离散化充放电倍率
     rate_ch = (10*current_list[:, 0]).long()
     rate_dch = (10*current_list[:, 1]).long()
     
-    # 构建输入特征（与训练脚本一致）
-    input_features = torch.stack([tem_tensors[:, :-5], volt_tensors[:, :-5]], dim=2)  # shape: [num_samples, time_steps, 2]
+    # 构建输入特征：取前20个时刻作为输入
+    # input_features shape: [num_samples*cells_num, time_steps-5, 2]
+    input_features = torch.stack([
+        tem_tensors[:, :-predLen], 
+        volt_tensors[:, :-predLen]
+    ], dim=2)
     
-    # 目标为未来5个时刻（与训练脚本一致）
-    target = torch.stack([tem_tensors[:, -5:], volt_tensors[:, -5:]], dim=2)
+    # 目标为未来5个时刻
+    # target shape: [num_samples*cells_num, 5, 2]
+    target = torch.stack([
+        tem_tensors[:, -predLen:], 
+        volt_tensors[:, -predLen:]
+    ], dim=2)
     
-    # 数据集划分（与训练脚本一致）
-    dataset_size = num_samples
+    # 数据集划分 - 按顺序划分（不使用random_split保持时间顺序）
+    dataset_size = num_total_cells
     train_size = int(0.8 * dataset_size)
     test_size = dataset_size - train_size
     
-    # 构建数据集（与训练脚本一致）
+    # 构建数据集 - 保持时间顺序
     dataset = TimeSeriesDataset(input_features, rate_ch, rate_dch, target)
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+    # 前80%用于训练，后20%用于测试
+    train_dataset = Subset(dataset, range(train_size))
+    test_dataset = Subset(dataset, range(train_size, dataset_size))
     
     # 加载新数据模型
     new_data_model = load_new_data_model(device=device)
     
-    # 计算阈值 - 使用训练集的平均MSE作为基准（与老数据处理方式一致）
+    # 计算阈值 - 使用训练集的平均MSE作为基准
     print("计算检测阈值...")
     train_mse_list = []
     with torch.no_grad():
-        for i in range(len(train_dataset)):  # 取部分训练样本计算阈值
+        for i in range(len(train_dataset)):
             x_seq, ch, dch, y_true = train_dataset[i]
             x_seq = x_seq.unsqueeze(0).to(device)
             ch = torch.tensor([ch.item()]).to(device)
@@ -868,45 +900,111 @@ def process_new_data(myargs, device):
             mse = torch.mean((y_pred - y_true) ** 2).item()
             train_mse_list.append(mse)
     
-    # 阈值计算方式与老数据一致：使用训练集的平均MSE
+    # 阈值计算方式：使用训练集的平均MSE
     threshold = np.mean(train_mse_list)
     print(f"检测阈值: {threshold:.6f} (基于训练集平均MSE)")
     
-    # 检测过程
-    detect_dict = {}
-    batch = 1
+    # 将测试集索引转换为 (sample_idx, cell_idx) 的映射
+    # 假设测试集包含从某个索引开始的所有数据点
+    test_indices = list(range(len(test_dataset)))
     
-    print("开始新数据检测...")
-    # 使用测试集进行检测
-    for i in range(min(10, len(test_dataset))):  # 只处理前10个测试样本作为示例
-        # 从测试集获取样本
-        x_seq, ch, dch, y_true = test_dataset[i]
-        x_seq = x_seq.unsqueeze(0).to(device)
-        ch = torch.tensor([ch.item()]).to(device)  # 处理标量索引
-        dch = torch.tensor([dch.item()]).to(device)  # 处理标量索引
-        y_true = y_true.unsqueeze(0).to(device)
+    # 根据加载数据时的结构，每个样本有 cells_num 个数据点
+    # 计算实际样本数
+    num_test_samples = len(test_dataset) // cells_num
+    print(f"测试集包含 {num_test_samples} 个样本，每个样本 {cells_num} 个cells")
+    
+    # 初始化每个cell的连续异常计数（共22个cells）
+    cell_abnormal_count = [0] * cells_num  # 连续异常计数
+    cell_status = [0] * cells_num  # 当前状态：0正常，1异常
+    detect_results = []  # 存储检测结果
+    
+    print("开始新数据检测（连续异常计数逻辑）...")
+    print("规则：连续15次异常才报警，中间有正常则清零重新计数")
+    print(f"将处理 {num_test_samples} 个测试样本\n")
+    
+    # 按sample遍历测试数据
+    for sample_idx in range(num_test_samples):  # 处理前50个样本
+        sample_abnormal_flags = []
         
-        with torch.no_grad():
-            y_pred = new_data_model(x_seq, ch, dch)
+        # 对每个sample内的所有cells进行检测
+        for cell_idx in range(cells_num):
+            # 计算test_dataset中的索引
+            dataset_idx = sample_idx * cells_num + cell_idx
+            if dataset_idx >= len(test_dataset):
+                break
+                
+            # 从测试集获取样本
+            x_seq, ch, dch, y_true = test_dataset[dataset_idx]
+            x_seq = x_seq.unsqueeze(0).to(device)
+            ch = torch.tensor([ch.item()]).to(device)
+            dch = torch.tensor([dch.item()]).to(device)
+            y_true = y_true.unsqueeze(0).to(device)
             
-            # 计算预测误差
-            mse = torch.mean((y_pred - y_true) ** 2).item()
-            
-            # 阈值判断（与老数据处理方式一致）
-            if mse > threshold:
-                detect_dict[f"新数据样本_{batch}"] = 1
-                print(f"样本 {batch}: 检测到异常 (MSE: {mse:.6f} > 阈值: {threshold:.6f})")
-            else:
-                detect_dict[f"新数据样本_{batch}"] = 0
-                print(f"样本 {batch}: 正常 (MSE: {mse:.6f} <= 阈值: {threshold:.6f})")
+            with torch.no_grad():
+                y_pred = new_data_model(x_seq, ch, dch)
+                
+                # 计算预测误差
+                mse = torch.mean((y_pred - y_true) ** 2).item()
+                
+                # 连续异常检测逻辑
+                if mse > threshold:
+                    # 异常：连续计数+1
+                    cell_abnormal_count[cell_idx] += 1
+                    
+                    # 检查是否达到连续15次
+                    if cell_abnormal_count[cell_idx] >= 4:
+                        cell_status[cell_idx] = 1  # 标记为异常
+                        print(f"Sample {sample_idx+1}, Cell {cell_idx+1}: 连续15次异常检测！标记为异常（MSE: {mse:.6f}）")
+                        cell_abnormal_count[cell_idx] = 0  # 清零，准备下次统计
+                        sample_abnormal_flags.append(1)
+                    else:
+                        sample_abnormal_flags.append(0)  # 未达到15次，还不报警
+                        # 只在计数为5的倍数时打印，避免太多输出
+                        if cell_abnormal_count[cell_idx] % 5 == 0:
+                            print(f"Sample {sample_idx+1}, Cell {cell_idx+1}: 连续异常计数={cell_abnormal_count[cell_idx]}/15 (MSE: {mse:.6f})")
+                else:
+                    # 正常：清零计数
+                    if cell_abnormal_count[cell_idx] > 0:
+                        print(f"Sample {sample_idx+1}, Cell {cell_idx+1}: 正常，清零异常计数 (之前计数: {cell_abnormal_count[cell_idx]})")
+                    cell_abnormal_count[cell_idx] = 0
+                    cell_status[cell_idx] = 0
+                    sample_abnormal_flags.append(0)
         
-        batch += 1
+        # 记录当前sample的检测结果
+        detect_results.append({
+            'sample': sample_idx + 1,
+            'cells_status': sample_abnormal_flags.copy()
+        })
+        
+        # 每10个sample打印一次进度
+        if (sample_idx + 1) % 10 == 0:
+            print(f"已处理 {sample_idx + 1}/{num_test_samples} 个样本")
+    
+    # 统计最终结果
+    print("\n检测结果统计：")
+    final_status = {}
+    for cell_idx in range(cells_num):
+        final_status[f'Cell_{cell_idx+1}'] = cell_status[cell_idx]
     
     # 保存结果
-    df_detect_dict = pd.DataFrame(list(detect_dict.items()), columns=("sample", "fault"))
-    print(df_detect_dict)
-    df_detect_dict.to_csv("output_new_data_detect.csv", index=True, encoding="utf-8")
-    print("新数据检测完成，结果已保存到 output_new_data_detect.csv")
+    result_rows = []
+    for result in detect_results:
+        result_rows.append({
+            'sample': result['sample'],
+            **{f'cell_{i+1}': result['cells_status'][i] if i < len(result['cells_status']) else 0 
+               for i in range(cells_num)}
+        })
+    
+    df_results = pd.DataFrame(result_rows)
+    df_results.to_csv("output_new_data_detect.csv", index=False, encoding="utf-8-sig")
+    
+    # 打印最终状态
+    print("每个cell的最终状态：")
+    for cell_idx, status in enumerate(cell_status):
+        status_str = "异常" if status == 1 else "正常"
+        print(f"  Cell {cell_idx+1}: {status_str}")
+    
+    print(f"\n新数据检测完成，结果已保存到 output_new_data_detect.csv")
     
     return 0
 
@@ -1065,6 +1163,10 @@ if __name__ == "__main__":
                             help='path to Normal dataset')
         parser.add_argument('--window', type=int, default=10,
                             help='window size')
+        parser.add_argument('--newwindow', type=int, default=20,
+                            help='new data window size')
+        parser.add_argument('--newpredLen', type=int, default=5,
+                            help='new data prediction length')
 #         parser.add_argument('--sample_rate', type=int, default=10,
 #                             help='sample rate')
 
